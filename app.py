@@ -19,8 +19,8 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE = BASE_DIR / "drainwatch.db"
-UPLOAD_FOLDER = BASE_DIR / "uploads"
+DATABASE = Path(os.getenv("DATABASE_PATH", "/tmp/drainwatch.db"))
+UPLOAD_FOLDER = Path(os.getenv("UPLOAD_PATH", "/tmp/uploads"))
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png"}
 STATUSES = ["Reported", "Verified", "Assigned", "In Progress", "Resolved"]
 
@@ -126,41 +126,63 @@ def report():
     if request.method == "GET":
         return render_template("report.html")
 
-    photo = request.files.get("photo")
-    description = request.form.get("description", "").strip()
-    address = request.form.get("address", "").strip()
-
+    # --- Begin robust report handling ---
     try:
-        latitude = float(request.form.get("latitude", ""))
-        longitude = float(request.form.get("longitude", ""))
-        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-            raise ValueError
-    except (TypeError, ValueError):
-        flash("Please select a valid location on the map.", "danger")
-        return render_template("report.html"), 400
+        # Validate and parse location
+        try:
+            latitude = float(request.form.get("latitude", ""))
+            longitude = float(request.form.get("longitude", ""))
+            if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+                raise ValueError
+        except (TypeError, ValueError):
+            flash("Please select a valid location on the map.", "danger")
+            return render_template("report.html"), 400
 
-    if not photo or not photo.filename or not allowed_file(photo.filename):
-        flash("Upload a JPG, JPEG, or PNG photo of the blockage.", "danger")
-        return render_template("report.html"), 400
-    if not description:
-        flash("Add a short description of the blockage.", "danger")
-        return render_template("report.html"), 400
+        # Validate image
+        photo = request.files.get("photo")
+        if not photo or not photo.filename or not allowed_file(photo.filename):
+            flash("Upload a JPG, JPEG, or PNG photo of the blockage.", "danger")
+            return render_template("report.html"), 400
 
-    filename = f"{secrets.token_hex(8)}_{secure_filename(photo.filename)}"
-    photo.save(UPLOAD_FOLDER / filename)
-    now = datetime.now().isoformat(timespec="seconds")
-    db = get_db()
-    cursor = db.execute(
-        """INSERT INTO reports
-        (ticket_id, photo_path, latitude, longitude, address, ward, description, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'Reported', ?, ?)""",
-        ("PENDING", filename, latitude, longitude, address, detect_ward(latitude, longitude), description, now, now),
-    )
-    report_id = cursor.lastrowid
-    ticket_id = make_ticket_id(report_id)
-    db.execute("UPDATE reports SET ticket_id = ? WHERE id = ?", (ticket_id, report_id))
-    db.commit()
-    return redirect(url_for("ticket", ticket_id=ticket_id))
+        # Validate description
+        description = request.form.get("description", "").strip()
+        if not description:
+            flash("Add a short description of the blockage.", "danger")
+            return render_template("report.html"), 400
+
+        # Optional fields
+        address = request.form.get("address", "").strip()
+
+        # Ensure upload folder exists (defensive)
+        UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+
+        # Secure and store the uploaded file
+        filename = f"{secrets.token_hex(8)}_{secure_filename(photo.filename)}"
+        photo_path = UPLOAD_FOLDER / filename
+        photo.save(photo_path)
+
+        # Insert into DB (temporary ticket_id, will be updated)
+        now = datetime.now().isoformat(timespec="seconds")
+        db = get_db()
+        cursor = db.execute(
+            """INSERT INTO reports
+            (ticket_id, photo_path, latitude, longitude, address, ward, description, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'Reported', ?, ?)""",
+            ("PENDING", filename, latitude, longitude, address,
+             detect_ward(latitude, longitude), description, now, now),
+        )
+        report_id = cursor.lastrowid
+        ticket_id = make_ticket_id(report_id)
+        db.execute("UPDATE reports SET ticket_id = ? WHERE id = ?", (ticket_id, report_id))
+        db.commit()
+        flash(f"{ticket_id} submitted successfully!", "success")
+        return redirect(url_for("ticket", ticket_id=ticket_id))
+    except Exception as e:
+        # Log the exception for debugging (stdout is captured by Vercel)
+        app.logger.error(f"Report submission failed: {e}", exc_info=True)
+        flash("An unexpected error occurred while submitting the report. Please try again.", "danger")
+        return render_template("report.html"), 500
+    # --- End robust report handling ---
 
 
 @app.route("/ticket/<ticket_id>")
